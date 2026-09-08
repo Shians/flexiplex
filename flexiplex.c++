@@ -60,7 +60,7 @@ void print_usage(){
   cerr << "                     one row per barcode, or 2) a comma-separated string of barcodes.\n";
   cerr << "                     Without this option, flexiplex will search and report possible barcodes.\n";
   cerr << "                     The generated list can be used for known_list in subsequent runs.\n";
-  cerr << "     -l true/false   Replace read ID with barcodes+UMI (default: true)\n"; 
+  cerr << "     -l true/false   Replace read ID with barcodes+UMI (default: true)\n";
   cerr << "     -r true/false   Remove search strings including flanking sequence and split read\n";
   cerr << "                     if multiple barcodes found (default: true).\n";
   cerr << "     -a true/false   Output all reads, including those without a barcode match\n";
@@ -166,6 +166,159 @@ struct SearchResult {
   bool chimeric;
 };
 
+// Hash index over a barcode whitelist covering every barcode within Hamming
+// distance <=1; assumes no two known barcodes share a 1-mismatch neighbor.
+class BarcodeIndex {
+public:
+  explicit BarcodeIndex(const unordered_set<string> &known_barcodes) {
+    if (known_barcodes.empty()) return;
+
+    // Allocate memory, reserving space for the exact matches and all single-
+    // substitution variants.
+    barcode_length_ = known_barcodes.begin()->length();
+    table_.reserve(known_barcodes.size() * (1 + 3 * barcode_length_));
+
+    // Pass A: exact matches (distance 0). known_barcodes elements are unique,
+    // so these insertions can never collide with each other.
+    for (const string &bc : known_barcodes) {
+      table_.emplace(bc, Entry{0, &bc});
+    }
+
+    // Pass B: single-substitution variants (distance 1). A key already
+    // present (either an exact barcode, or another barcode's variant that
+    // got there first) is left as-is -- see the ambiguity note above.
+    static const char BASES[4] = {'A', 'C', 'G', 'T'};
+    for (const string &bc : known_barcodes) {
+      string variant = bc;
+      for (size_t pos = 0; pos < bc.length(); ++pos) {
+        const char original = bc[pos];
+        for (char base : BASES) {
+          if (base == original) continue;
+          variant[pos] = base;
+          table_.emplace(variant, Entry{1, &bc});
+        }
+        variant[pos] = original;
+      }
+    }
+  }
+
+  size_t barcode_length() const { return barcode_length_; }
+
+  struct Lookup {
+    bool found = false;
+    int distance = -1; // 0 or 1
+    const string *barcode = nullptr;
+  };
+
+  // window.substr(offset, length) is looked up; length must equal
+  // barcode_length() for a match to be possible.
+  Lookup lookup(const string &window, int offset, int length) const {
+    Lookup result;
+    if (length < 0 || static_cast<size_t>(length) != barcode_length_) return result;
+    if (offset < 0 || static_cast<size_t>(offset + length) > window.length()) return result;
+
+    auto it = table_.find(window.substr(offset, length));
+    if (it == table_.end()) return result;
+
+    result.found = true;
+    result.distance = it->second.distance;
+    result.barcode = it->second.barcode;
+    return result;
+  }
+
+private:
+  struct Entry {
+    unsigned char distance; // 0 or 1
+    const string *barcode;
+  };
+  unordered_map<string, Entry> table_;
+  size_t barcode_length_ = 0;
+};
+
+// q-gram inverted index used to narrow candidate barcodes before the full
+// edit-distance DP. A true match within edit distance k retains at least
+// (L-q+1) - q*k shared q-grams, so min_shared_qgrams must respect that bound.
+class QGramIndex {
+public:
+  explicit QGramIndex(const unordered_set<string> &known_barcodes,
+                       int max_barcode_edit_distance, int q_override = 0)
+      : q_(q_override > 0
+               ? q_override
+               : choose_q(known_barcodes.empty() ? 0 : static_cast<int>(known_barcodes.begin()->length()),
+                          max_barcode_edit_distance)) {
+    buckets_.resize(size_t(1) << (2 * q_));
+
+    for (const string &bc : known_barcodes) {
+      int len = static_cast<int>(bc.length());
+      for (int i = 0; i + q_ <= len; i++) {
+        int code = encode_qgram(bc.c_str() + i, q_);
+        if (code < 0) continue;
+        buckets_[code].push_back(&bc);
+      }
+    }
+  }
+
+  int q() const { return q_; }
+
+  // Candidates (pointers into the original known_barcodes set) sharing at
+  // least min_shared_qgrams q-grams (by value) with `window`. Empty if
+  // window is shorter than q or contains no valid q-grams.
+  vector<const string *> candidates(const string &window, int min_shared_qgrams) const {
+    unordered_map<const string *, int> votes;
+    int len = static_cast<int>(window.length());
+
+    for (int i = 0; i + q_ <= len; i++) {
+      int code = encode_qgram(window.c_str() + i, q_);
+      if (code < 0) continue;
+      for (const string *bc : buckets_[code]) {
+        votes[bc]++;
+      }
+    }
+
+    vector<const string *> result;
+    result.reserve(votes.size());
+    for (const auto &kv : votes) {
+      if (kv.second >= min_shared_qgrams) result.push_back(kv.first);
+    }
+    return result;
+  }
+
+private:
+  static int base_code(char c) {
+    switch (c) {
+      case 'A': return 0;
+      case 'C': return 1;
+      case 'G': return 2;
+      case 'T': return 3;
+      default: return -1;
+    }
+  }
+
+  // 2-bit-packs q consecutive bases starting at s into an integer in
+  // [0, 4^q). Returns -1 if any base isn't a plain A/C/G/T.
+  static int encode_qgram(const char *s, int q) {
+    int code = 0;
+    for (int i = 0; i < q; i++) {
+      int b = base_code(s[i]);
+      if (b < 0) return -1;
+      code = (code << 2) | b;
+    }
+    return code;
+  }
+
+  // Largest q that keeps the correctness bound above zero, floored/capped
+  // to bound memory and filter usefulness.
+  static int choose_q(int barcode_length, int max_barcode_edit_distance) {
+    int q = barcode_length / (max_barcode_edit_distance + 1);
+    if (q < 3) q = 3;
+    if (q > 10) q = 10;
+    return q;
+  }
+
+  int q_;
+  vector<vector<const string *>> buckets_; // size 4^q, indexed by 2-bit-packed q-gram
+};
+
 // Code for fast edit distance calculation for short sequences modified from
 // https://en.wikibooks.org/wiki/Algorithm_Implementation/Strings/Levenshtein_distance#C++
 // s2 is always assumned to be the shorter string (barcode)
@@ -174,7 +327,11 @@ unsigned int edit_distance(const std::string& s1, const std::string& s2, unsigne
   std::size_t len1 = s1.size()+1, len2 = s2.size()+1;
   const char * s1_c = s1.c_str(); const char * s2_c = s2.c_str();
 
-  vector< unsigned int> dist_holder(len1*len2);
+  // Reused across calls (grow-only) to avoid a heap allocation on every
+  // invocation; every cell is overwritten before being read, so stale
+  // values never leak between calls.
+  static thread_local std::vector<unsigned int> dist_holder;
+  if (dist_holder.size() < len1*len2) dist_holder.resize(len1*len2);
   //initialise the edit distance matrix.
   //penalise for gaps at the start and end of the shorter sequence (j)
   //but not for shifting the start/end of the longer sequence (i,0)
@@ -244,7 +401,7 @@ std::string get_umi(const std::string &seq,
   }
 
   umi_length = search_pattern[umi_index].second.length();
-  
+
   if (umi_index == bc_index + 1) {
     // UMI right after BC
     if (sliding_window_match) {
@@ -300,6 +457,8 @@ std::string get_umi(const std::string &seq,
 
 Barcode get_barcode(string & seq,
 		    unordered_set<string> *known_barcodes,
+		    const BarcodeIndex &barcode_index,
+		    const QGramIndex &qgram_index,
 		    int flank_max_editd,
 		    int barcode_max_editd,
         const std::vector<std::pair<std::string, std::string>> &search_pattern) {
@@ -447,12 +606,53 @@ Barcode get_barcode(string & seq,
 
   std::string barcode_seq = seq.substr(left_bound, max_length);
 
-  //iterate over all the known barcodes, checking each sequentially
-  unordered_set<string>::iterator known_barcodes_itr=known_barcodes->begin();
+  // Tier 1: O(1) hash lookup at every offset for a barcode within Hamming
+  // distance <=1 (see BarcodeIndex).
+  int bc_length = static_cast<int>(search_pattern[bc_index].second.length());
+  int n_offsets = static_cast<int>(barcode_seq.length()) - bc_length + 1;
+
+  if (n_offsets >= 1 && barcode_index.barcode_length() == static_cast<size_t>(bc_length)) {
+    int best_distance = 100;
+    const string *best_barcode = nullptr;
+    int best_offset = -1;
+
+    for (int offset = 0; offset < n_offsets; offset++) {
+      BarcodeIndex::Lookup hit = barcode_index.lookup(barcode_seq, offset, bc_length);
+      if (!hit.found) continue;
+      if (hit.distance < best_distance) {
+        best_distance = hit.distance;
+        best_barcode = hit.barcode;
+        best_offset = offset;
+        if (best_distance == 0) break; // can't do better than a perfect match
+      }
+    }
+
+    if (best_distance <= 1 && best_distance <= barcode_max_editd) {
+      barcode.editd = best_distance;
+      barcode.unambiguous = true;
+      barcode.barcode = *best_barcode;
+      unsigned int endDistance = static_cast<unsigned int>(best_offset + bc_length);
+      barcode.umi = get_umi(seq, search_pattern, read_to_subpatterns, umi_index, bc_index, true, left_bound, endDistance);
+      return(barcode);
+    }
+  }
+
+  // Tier 2: fall back to the exhaustive edit-distance scan, narrowed by the
+  // q-gram index where its correctness bound is usable (see QGramIndex).
+  int min_shared_qgrams = (bc_length - qgram_index.q() + 1) - qgram_index.q() * barcode_max_editd;
+
+  vector<const string*> candidate_pool;
+  if (bc_length >= qgram_index.q() && min_shared_qgrams >= 1) {
+    candidate_pool = qgram_index.candidates(barcode_seq, min_shared_qgrams);
+  } else {
+    candidate_pool.reserve(known_barcodes->size());
+    for (const string &bc : *known_barcodes) candidate_pool.push_back(&bc);
+  }
+
   unsigned int editDistance, endDistance;
 
-  for(; known_barcodes_itr != known_barcodes->end(); known_barcodes_itr++){
-    search_string = *known_barcodes_itr; //known barcode to check against
+  for (const string *candidate_ptr : candidate_pool) {
+    const string &search_string = *candidate_ptr;
     editDistance = edit_distance(barcode_seq, search_string, endDistance, barcode_max_editd);
 
     if (editDistance == barcode.editd) {
@@ -460,7 +660,7 @@ Barcode get_barcode(string & seq,
     } else if (editDistance < barcode.editd && editDistance <= barcode_max_editd) { // if best so far, update
       barcode.unambiguous = true;
       barcode.editd = editDistance;
-      barcode.barcode = *known_barcodes_itr;
+      barcode.barcode = search_string;
       barcode.umi = get_umi(seq, search_pattern, read_to_subpatterns, umi_index, bc_index, true, left_bound, endDistance);
 
       //if perfect match is found we're done.
@@ -476,12 +676,12 @@ Barcode get_barcode(string & seq,
 //search a read for one or more barcodes (parent function that calls get_barcode)
 //keep_unassigned reports a read whose flanking sequence was found but which
 //matched no known barcode, rather than discarding it (see the -a option).
-vector<Barcode> big_barcode_search(string & sequence, unordered_set<string> & known_barcodes, int max_flank_editd, int max_editd, const std::vector<std::pair<std::string, std::string>> &search_pattern, bool keep_unassigned=false) {
+vector<Barcode> big_barcode_search(string & sequence, unordered_set<string> & known_barcodes, const BarcodeIndex &barcode_index, const QGramIndex &qgram_index, int max_flank_editd, int max_editd, const std::vector<std::pair<std::string, std::string>> &search_pattern, bool keep_unassigned=false) {
 
   vector<Barcode> return_vec; //vector of all the barcodes found
 
   //search for barcode
-  Barcode result=get_barcode(sequence,&known_barcodes,max_flank_editd,max_editd, search_pattern); //,ss);
+  Barcode result=get_barcode(sequence,&known_barcodes,barcode_index,qgram_index,max_flank_editd,max_editd, search_pattern); //,ss);
   if(result.editd<=max_editd && result.unambiguous) //add to return vector if edit distance small enough
     return_vec.push_back(result);
 
@@ -493,7 +693,7 @@ vector<Barcode> big_barcode_search(string & sequence, unordered_set<string> & kn
       masked_sequence.replace(return_vec.at(i).flank_start,flank_length,string(flank_length,'X'));
     } //recursively call this function until no more barcodes are found
     vector<Barcode> masked_res;
-    masked_res=big_barcode_search(masked_sequence,known_barcodes,max_flank_editd,max_editd, search_pattern); //,ss);
+    masked_res=big_barcode_search(masked_sequence,known_barcodes,barcode_index,qgram_index,max_flank_editd,max_editd, search_pattern); //,ss);
     return_vec.insert(return_vec.end(),masked_res.begin(),masked_res.end()); //add to result
   } else if(keep_unassigned && result.flank_start>=0 && result.flank_editd<=max_flank_editd){
     //the flanking sequence was found but no known barcode matched it. Report the
@@ -577,7 +777,7 @@ void print_read(string read_id, string read, string qual,
       vec_bc.push_back(unassigned);
       vec_size=1;
     }
-    
+
     //loop over the barcodes found... usually will just be one
     for (int b = 0; b < vec_size; b++) {
 
@@ -656,6 +856,8 @@ void print_read(string read_id, string read, string qual,
 
 // separated out from main so that this can be run with threads
 void search_read(vector<SearchResult> & reads, unordered_set<string> & known_barcodes,
+  const BarcodeIndex &barcode_index,
+  const QGramIndex &qgram_index,
   int flank_edit_distance, int edit_distance,
   const std::vector<std::pair<std::string, std::string>> &search_pattern,
   bool keep_unassigned) {
@@ -665,6 +867,8 @@ void search_read(vector<SearchResult> & reads, unordered_set<string> & known_bar
     auto forward_reads = big_barcode_search(
       reads[r].line,
       known_barcodes,
+      barcode_index,
+      qgram_index,
       flank_edit_distance,
       edit_distance,
       search_pattern,
@@ -679,6 +883,8 @@ void search_read(vector<SearchResult> & reads, unordered_set<string> & known_bar
     auto reverse_reads = big_barcode_search(
         reads[r].rev_line,
 	known_barcodes,
+	barcode_index,
+	qgram_index,
 	flank_edit_distance,
 	edit_distance,
         search_pattern,
@@ -745,7 +951,7 @@ int main(int argc, char **argv) {
   bool remove_barcodes = true;        //(r)
   bool print_chimeric = false;        //(c)
   bool print_all_reads = false;       //(a)
-  
+
   std::vector<std::pair<std::string, std::string>> search_pattern;
 
   // Set of known barcodes
@@ -924,6 +1130,12 @@ int main(int argc, char **argv) {
 
   cerr << "For usage information type: flexiplex -h" << endl;
 
+  // O(1) Hamming-distance-<=1 lookup, tried before the exhaustive scan.
+  BarcodeIndex barcode_index(known_barcodes);
+
+  // Narrows candidates for the exhaustive scan; q is derived from -e/edit_distance.
+  QGramIndex qgram_index(known_barcodes, edit_distance);
+
   istream *in;
   ifstream reads_ifs;
 
@@ -1029,7 +1241,7 @@ int main(int argc, char **argv) {
                                           // reads.
           sr_v[t].resize(b + 1);
           threads[t] = std::thread(search_read, ref(sr_v[t]),
-                                   ref(known_barcodes), flank_edit_distance,
+                                   ref(known_barcodes), cref(barcode_index), cref(qgram_index), flank_edit_distance,
                                    edit_distance, ref(search_pattern),
                                    print_all_reads);
           for (int t2 = t + 1; t2 < n_threads; t2++) {
@@ -1041,7 +1253,7 @@ int main(int argc, char **argv) {
       }
       // send reads to the thread
       threads[t] =
-          std::thread(search_read, ref(sr_v[t]), ref(known_barcodes),
+          std::thread(search_read, ref(sr_v[t]), ref(known_barcodes), cref(barcode_index), cref(qgram_index),
                       flank_edit_distance, edit_distance, ref(search_pattern),
                       print_all_reads);
     }
